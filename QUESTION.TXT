@@ -1,0 +1,188 @@
+FROM THE ATTACHED QUERY WHICH IS TRANSITION FROM ORACLE TO SNOWFLAKE GETTING INCORRECT SNOWFLAKE OUTPUT , FOR PK_FACT_INBOUND TESTED WHIT SELECT 
+    'B-001-100/ITEM123-GRADE-A-SUPPORT1-INBREF456' AS input_string,
+    UPPER(TO_CHAR(MD5_BINARY('B-001-100/ITEM123-GRADE-A-SUPPORT1-INBREF456'))) AS snowflake_pk,
+    -- RAWTOHEX(standard_hash('B-001-100/ITEM123-GRADE-A-SUPPORT1-INBREF456','MD5')) AS oracle_pk
+FROM DUAL; RETURNS THE SAME VALUES , HELP ME DEBUG THE QUERY AND FIND THE ISSUE:
+ORACLE OUTPUT:
+F5E3EE34816DF5DE6EF156C16644F000	Reflex WEB B	1ST	355001925002156930	8141564171	R250036768	0185859546	1	1	3617132977437	RING GUCCI CREST	 	8163	M	 	JEWELRY STD	 	null	B	null	null	null	null	null	2025-07-29T08:54:02	2025-07-30T06:34:15.276	2025-07-28T00:00	2025-07-30T12:56:14.113154	2025-07-30T06:46:44	0
+
+snowflakeoutput:
+EA52FA4962FA0556E7C6EC62F14C4246	Reflex WEB B	1ST	355001925002156930	8141564171	R250036768	0185859546	1	1	3617132977437	RING GUCCI CREST	 	8163	M	 	JEWELRY STD	 		B							2025-07-30 06:34:15.276		2025-07-30 04:46:45.615	0
+
+
+Query below retiurns myltiply roes:
+--INBOUNDREF returns multiply rows
+WITH YY AS (
+    SELECT 
+        XX.INBOUNDREF,
+        XX.ASN,
+        XX.DEPOT,
+        XX.ACTIVITY,
+        XX.ITEM,
+        MAX(XX.GRADE) AS GRADE,
+        XX.SUPPORT
+    FROM (
+        SELECT 
+            RE.RENBLF AS INBOUNDREF,
+            RE.RERREC AS ASN,
+            VG.VGCDPO AS DEPOT,
+            VG.VGCACT AS ACTIVITY,
+            VG.VGNSUP AS SUPPORT,
+            VG.VGCART AS ITEM,
+            VG.VGCQAL AS GRADE
+        FROM MODELS.KERING_GLOBE.HLRECPP RE
+        INNER JOIN MODELS.KERING_GLOBE.HLMVTGP VG
+            ON RE.RECDPO = VG.VGCDPO
+            AND RE.RECACT = VG.VGCACT
+            AND RE.RENANN = VG.VGNANN
+            AND RE.RENREC = VG.VGNREC
+            AND VG.VGCTVG = '100'
+        WHERE RE.RECACT = '100'
+          AND RE.RECDPO = '001'
+          AND RE.RESVAL != 0
+        GROUP BY RE.RENBLF, RE.RERREC, VG.VGCDPO, VG.VGCACT, VG.VGNSUP, VG.VGCART, VG.VGCQAL
+    ) XX
+    GROUP BY XX.INBOUNDREF, XX.ASN, XX.DEPOT, XX.ACTIVITY, XX.SUPPORT, XX.ITEM
+)
+
+SELECT 
+    'B-' ||
+    TRIM(COALESCE(DEPOT, '')) || '-' ||
+    TRIM(COALESCE(ACTIVITY, '')) || '/' ||
+    TRIM(COALESCE(ITEM, '')) || '-' ||
+    TRIM(COALESCE(GRADE, '')) || '-' ||
+    TRIM(COALESCE(SUPPORT, '')) || '-' ||
+    TRIM(COALESCE(INBOUNDREF, '')) AS input_string
+FROM YY
+
+Excellent question. This is a great way to understand the data's journey. I'll provide a detailed review of the entire process based on the SQL files you've provided.
+
+The overall goal of these complex views is to transform data from a highly detailed and normalized operational database (your ERP/WMS source tables in MODELS.KERING_GLOBE) into a series of clean, wide, and easy-to-understand "fact" tables in your SMART_BI data warehouse. These fact tables are the foundation for dashboards and business reporting.
+
+Here's a breakdown of each process.
+
+1. Inbound Process (FACT_KER_01_INBOUND)
+What it does: This process tracks goods arriving at the warehouse. It provides a consolidated view of an inbound shipment line, comparing the initial forecast (what you were told you would receive) against what was physically received and put away.
+
+How it works: The core logic uses a UNION ALL to combine two different sources of data, which are then merged with a GROUP BY.
+
+Forecast Data: The first SELECT statement gets data from the xprc03p table. This table contains the Advance Shipping Notice (ASN) data sent via EDI, representing the FORECAST_QUANTITY.
+
+Actuals Data: The second SELECT gets data from hlrecpp (receipt header) and hlmvtgp (goods movement). This represents the physically counted goods, providing the ACTUAL_QUANTITY. This part also joins to the Historymovement tables to get truck arrival and departure times from the Yard Management System (YMS).
+
+Merge: The final GROUP BY combines the forecast and actuals rows into a single, complete record for each unique inbound line.
+
+Key Tables and Columns:
+
+xprc03p: Contains the initial ASN/EDI forecast.
+
+I22QTEX -> FORECAST_QUANTITY: The expected number of pieces.
+
+hlrecpp / hlmvtgp: The source of truth for what was physically received.
+
+VGQMVG -> ACTUAL_QUANTITY: The confirmed received quantity.
+
+VGCQAL -> QUALITY: The quality code of the received stock (e.g., 'STR').
+
+Historymovement: Provides timestamp data from the YMS.
+
+MOArrivalDate -> TRUCK_GATE_ARRIVAL: When the truck arrived at the facility.
+
+KBCARTP: The Article Master table, containing details about each SKU.
+
+CALMOD, CAPART, CACOLC -> MODEL, PART, COLOUR.
+
+2. Outbound Process (FACT_KER_02_OUTBOUND)
+What it does: This is the most comprehensive view. It tracks a customer order from the moment it enters the warehouse system until the truck departs. It links order details, preparation (picking/packing) instructions, carrier information, and final shipment data into one record.
+
+How it works: This view is a large chain of JOINs centered around the warehouse preparation order.
+
+It starts with the customer order header (HLODPEP).
+
+It then joins to the "preparation line" (HLPRPLP) to find out which SKUs are on the order.
+
+The "preparation header" (HLPRENP) is a key table that represents the internal work order for the warehouse.
+
+A critical component is the KBSHIPP table, which is joined twice using a "mother/child" logic:
+
+MOTHER: Joined on the original sales order ID to get order-level details (like brand, channel, initial planned dates).
+
+CHILD: Joined on the preparation number to get shipment-level details (like actual packed/shipped dates, invoice codes).
+
+Finally, it joins out to many other tables to get carrier info (HLCHARP), YMS truck data (TIEADRSLOTTASK, Historymovement), and VAS details from the pre-aggregated VAS table.
+
+Key Tables and Columns:
+
+HLODPEP: The customer order header.
+
+OERODP -> SAP_ORDERID: The customer's order number.
+
+HLPRENP: The preparation header (warehouse work order).
+
+PENPRE -> PREPARATION_NUMBER: The internal reference for the picking/packing job.
+
+HLPRPLP: Preparation lines, linking SKUs to the work order.
+
+P1QODP -> QUANTITY_ORDERED: The number of pieces ordered for a specific SKU.
+
+KBSHIPP: Contains rich shipping details.
+
+SHDTKP (from CHILD join) -> TK05_PACKED_DATE: The timestamp when the order was fully packed.
+
+SHDTKS (from CHILD join) -> TK05_SHIPPED_DATE: The timestamp when the shipment was confirmed.
+
+SHCDOR (from MOTHER join) -> BRAND: The brand associated with the order.
+
+3. VAS Process (FACT_KER_02_OUTBOUND_VAS)
+What it does: VAS stands for Value-Added Services (e.g., gift wrapping, special labeling, security tags). This process identifies all VAS tasks associated with a preparation order and aggregates them into a single list. The main outbound view then uses this pre-aggregated result.
+
+How it works: The magic here is the UNPIVOT function used in the CRT_BILLING_VAS view.
+
+The source table KBMCDLP is poorly structured for analytics; it stores up to 25 different VAS codes in 25 separate columns (CLVA01, CLVA02, etc.).
+
+The UNPIVOT function cleverly transforms these 25 columns into a single column of data, creating multiple rows for each original row. This "long" format is easy to group and analyze.
+
+The view then aggregates these rows to create a distinct list of VAS codes and clusters for each preparation number.
+
+Key Tables and Columns:
+
+KBMCDLP: The source table for VAS tasks.
+
+CLVA01, CLVA02, ... CLVA25 -> These contain the different VAS codes.
+
+FACT_KER_02_OUTBOUND_VAS: The target summary table.
+
+VAS_CODE, VAS_CLUSTER -> The aggregated list of VAS codes and their associated clusters for a given preparation number.
+
+4. Saturation Process (FACT_KER_03_SATURATION_*)
+What it does: This is the most granular view. Its purpose is to analyze packing efficiency. It answers the question: "For this specific order, which exact SKUs, and in what quantity, went into which specific shipping carton?" It provides data on the volume of the items vs. the volume of the carton, weights, and the type of packaging used vs. what was forecasted.
+
+How it works: These views are centered around the table that links SKUs to parcels.
+
+The process starts from the "Goods in Parcel" tables (HLGESOP or HLGEINP). This is the lowest level of detail, explicitly connecting a quantity of a SKU to a parcel ID.
+
+From there, it joins out to get details about the SKU (from KBCARTP to get its dimensions and weight) and the Parcel (from HLCOSOP and HLTYCPP to get its dimensions and empty weight).
+
+It also joins to KBMHLPP ("precubing"), which contains the system's forecast of what parcel should have been used. This allows for a Forecast vs. Actual analysis of packaging.
+
+Key Tables and Columns:
+
+HLGESOP / HLGEINP: The core table.
+
+GSQGEI -> QUANTITY: The number of pieces of a specific SKU in a specific parcel.
+
+GSCART -> The SKU identifier.
+
+GSNCOL -> UDM: The unique Parcel ID / Carton Number.
+
+KBCARTP: Article Master.
+
+CAPHGH, CAPWID, CAPDPT -> The height, width, and depth of the SKU, used to calculate SKU_VOLUME.
+
+HLTYCPP: Parcel Type Master.
+
+O1MHUT, O1MPUT, O1MLUT -> INTERNAL_HEIGHT/WIDTH/LENGTH_PARCEL_ACTUAL: The dimensions of the carton that was actually used.
+
+KBMHLPP: Prec/ubing Forecast.
+
+HOTCOL -> PARCEL_TYPE_FORECAST: The parcel type the system recommended.
